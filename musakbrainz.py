@@ -5,7 +5,8 @@ A merged script that:
 2) Extracts metadata for each file (title, tracknumber, etc.) via mutagen.
 3) Guesses the artist/album from the top-level directory name.
 4) Looks up matching release data on MusicBrainz (musicbrainzngs).
-5) Prints a side-by-side diff (left = local, right = MB).
+5) Prints a side-by-side diff (left = local, right = MB),
+   but if a line is identical in both, it shows it once in the center.
 
 Usage:
   python complete_script.py "/path/to/A Plus D - Best of Bootie Mashup 2024"
@@ -13,42 +14,37 @@ Usage:
 
 import os
 import sys
-import subprocess
 import argparse
 import re
 
-# For MusicBrainz queries
 import musicbrainzngs
-
-# For reading local audio file metadata
 from mutagen import File as MutagenFile
 
-# ==========================================
-# 1) Configure MusicBrainz + parse arguments
-# ==========================================
-
+# Configure MusicBrainz
 musicbrainzngs.set_useragent(
     "MusicBrainzSideBySideDiff",
     "0.1",
     "https://example.org/my-musicbrainz-app"
 )
 
+
 def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Recursively gather local tracks, then produce a side-by-side diff vs. MusicBrainz."
     )
-    parser.add_argument("root_directory", help="Root directory of the album (including subfolders).")
+    parser.add_argument(
+        "root_directory",
+        help="Root directory of the album (including subfolders)."
+    )
     return parser.parse_args()
 
-# ==========================
-# 2) Utility: guess Artist/Album
-# ==========================
 
 def guess_artist_and_album_from_directory(dir_name):
     """
     Naive approach: parse "Artist - Album" from directory name.
     If that fails, we treat the entire name as "album" and artist=None.
-    Adjust this logic to suit your folder naming patterns.
+    Adjust as needed for your folder naming patterns.
     """
     pattern = r"^(.*?)\s*-\s*(.*)$"
     match = re.match(pattern, dir_name)
@@ -57,12 +53,10 @@ def guess_artist_and_album_from_directory(dir_name):
         return artist.strip(), album.strip()
     return None, dir_name.strip()
 
-# ==========================
-# 3) Recursively find audio files
-# ==========================
 
 # Expand to your typical set of audio file extensions
 VALID_AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".ogg"}
+
 
 def find_audio_files_recursively(root_directory):
     """
@@ -70,7 +64,7 @@ def find_audio_files_recursively(root_directory):
     Yields full file paths to each found audio file.
     """
     for dirpath, dirnames, filenames in os.walk(root_directory):
-        # Optionally skip hidden directories:
+        # Optionally skip hidden directories
         dirnames[:] = [d for d in dirnames if not d.startswith('.')]
         for fname in sorted(filenames):
             if fname.startswith('.'):
@@ -80,9 +74,6 @@ def find_audio_files_recursively(root_directory):
             if ext in VALID_AUDIO_EXTENSIONS:
                 yield full_path
 
-# ==========================
-# 4) Extract metadata (with mutagen)
-# ==========================
 
 def extract_tags_from_file(file_path):
     """
@@ -121,9 +112,6 @@ def extract_tags_from_file(file_path):
 
     return audio_data
 
-# ==========================
-# 5) Gather all local tracks in a single list
-# ==========================
 
 def gather_all_local_tracks(root_directory):
     """
@@ -157,9 +145,6 @@ def gather_all_local_tracks(root_directory):
 
     return all_tracks
 
-# ==========================
-# 6) MusicBrainz: find best release match
-# ==========================
 
 def find_best_release_match(artist_name, album_name):
     """
@@ -169,7 +154,11 @@ def find_best_release_match(artist_name, album_name):
     if not artist_name:
         result = musicbrainzngs.search_releases(release=album_name, limit=5)
     else:
-        result = musicbrainzngs.search_releases(artist=artist_name, release=album_name, limit=5)
+        result = musicbrainzngs.search_releases(
+            artist=artist_name,
+            release=album_name,
+            limit=5
+        )
 
     releases = result.get('release-list', [])
     if not releases:
@@ -181,42 +170,69 @@ def find_best_release_match(artist_name, album_name):
     try:
         full_release = musicbrainzngs.get_release_by_id(
             release_id,
-            includes=["artist-credits", "recordings", "url-rels", "labels", "release-groups"]
+            includes=["artist-credits", "recordings", "url-rels",
+                      "labels", "release-groups"]
         )
         return full_release["release"]
     except musicbrainzngs.WebServiceError:
         return None
 
-# ==========================
-# 7) Side-by-Side Diff Formatting
-# ==========================
 
-def side_by_side_format(lines_left, lines_right, left_width=60):
+def side_by_side_format(
+        lines_left,
+        lines_right,
+        left_width=60,
+        unify_if_identical=True
+    ):
     """
     Produce a list of strings showing side-by-side comparison.
-    Each line: left text padded to left_width, a separator, and the right text.
+
+    If `unify_if_identical` is True and a line is identical (and non-empty)
+    on both sides, we display it once centered. Otherwise, we do left|right.
+
+    Each non-unified line: left text padded to `left_width`, a separator,
+    and the right text.
     """
     output = []
     max_len = max(len(lines_left), len(lines_right))
+    total_width = left_width * 2 + 3  # 3 = space + '|' + space
+
     for i in range(max_len):
         left_line = lines_left[i] if i < len(lines_left) else ""
         right_line = lines_right[i] if i < len(lines_right) else ""
-        output.append(f"{left_line:<{left_width}} | {right_line}")
+
+        if (unify_if_identical
+                and left_line.strip()
+                and left_line == right_line):
+            # Show the identical line once, centered
+            merged_line = f"          == {left_line}"
+            output.append(merged_line)
+        else:
+            # Normal side-by-side
+            output.append(f"{left_line:<{left_width}} | {right_line}")
+
     return output
+
 
 def generate_side_by_side_diff(local_data, mb_data):
     """
     local_data is a dict:
-       { "artist": ..., "album": ..., "tracks": [ { ... }, ... ] }
+       {
+         "artist": ...,
+         "album": ...,
+         "tracks": [ { "filename":..., "title":..., etc. }, ... ]
+       }
 
     mb_data is the MusicBrainz release dictionary.
 
-    Returns a single string with side-by-side columns:
+    Returns a single string with a side-by-side diff:
       LEFT  = local data
       RIGHT = MusicBrainz data
+
+    Identical lines appear once in the middle.
     """
 
-    # ---- Release-level lines ----
+    # --- Release-level lines (Left vs Right) ---
     local_artist = local_data["artist"] or "Unknown Local Artist"
     local_album = local_data["album"] or "Unknown Local Album"
     local_release_lines = [
@@ -225,24 +241,26 @@ def generate_side_by_side_diff(local_data, mb_data):
         "(subdir logic not shown at release-level)"
     ]
 
+    # Build MB release lines
     mb_release_lines = []
-    # Collect MB artists
     mb_artists = []
     for credit in mb_data.get('artist-credit', []):
         if isinstance(credit, dict) and "artist" in credit:
             mb_artists.append(credit["artist"]["name"])
         elif isinstance(credit, str):
             mb_artists.append(credit)
+
     mb_artist_joined = " & ".join(mb_artists) if mb_artists else "Unknown MB Artist"
     mb_release_lines.append(f"Artist: {mb_artist_joined}")
 
     mb_album = mb_data.get("title") or "Unknown MB Album"
     mb_release_lines.append(f"Album:  {mb_album}")
 
-    # Possibly show MB release URI
     release_id = mb_data.get('id')
     if release_id:
-        mb_release_lines.append(f"MB Release URI: https://musicbrainz.org/release/{release_id}")
+        mb_release_lines.append(
+            f"MB Release URI: https://musicbrainz.org/release/{release_id}"
+        )
 
     # Possibly show MB "url-rels"
     for urlrel in mb_data.get("url-relation-list", []):
@@ -250,29 +268,35 @@ def generate_side_by_side_diff(local_data, mb_data):
         target = urlrel.get('target')
         mb_release_lines.append(f" - {rel_type}: {target}")
 
-    release_info_diff = side_by_side_format(local_release_lines, mb_release_lines, left_width=60)
+    release_info_diff = side_by_side_format(
+        local_release_lines,
+        mb_release_lines,
+        left_width=60,
+        unify_if_identical=True
+    )
 
-    # ---- Track-level lines ----
+    # --- Track-level lines ---
     # Flatten MB's tracklists
     mb_tracks = []
     for medium in mb_data.get('medium-list', []):
         for track in medium.get('track-list', []):
             recording = track.get('recording', {})
             track_mbid = recording.get('id')
-            track_uri = f"https://musicbrainz.org/recording/{track_mbid}" if track_mbid else None
+            track_uri = (f"https://musicbrainz.org/recording/{track_mbid}"
+                         if track_mbid else None)
+            # 'artist-credit-phrase' may not be returned by default,
+            # but if you have it, we can store it:
+            martist = recording.get('artist-credit-phrase', "")
 
             mb_tracks.append({
                 "position": track.get("position"),
                 "title": recording.get("title", ""),
                 "uri": track_uri,
-                "artist": recording.get('artist-credit-phrase'),
+                "artist": martist
             })
 
-    # Sort local tracks by (subdir, tracknumber) or fallback
-    # If subdir = "", that sorts first; then within subdir, tracknumber ascending
+    # Sort local tracks by (subdir, tracknumber)
     def track_sort_key(t):
-        # If tracknumber is None or not numeric, fallback
-        # e.g. "07" -> 7, handle exceptions
         try:
             num = int(t["tracknumber"]) if t["tracknumber"] else 9999
         except ValueError:
@@ -280,7 +304,6 @@ def generate_side_by_side_diff(local_data, mb_data):
         return (t["subdir"], num)
 
     sorted_local_tracks = sorted(local_data["tracks"], key=track_sort_key)
-
     track_lines = []
     max_tracks = max(len(sorted_local_tracks), len(mb_tracks))
 
@@ -288,18 +311,22 @@ def generate_side_by_side_diff(local_data, mb_data):
         # Local side
         if i < len(sorted_local_tracks):
             lt = sorted_local_tracks[i]
+
+            filename = lt.get('filename')
+            if subdir := lt.get('subdir'):
+                filename = f"{subdir}/{filename}"
+
             ln = lt.get("tracknumber", "")
             ltitle = lt.get("title", "")
             lartist = lt.get("artist", "")
-            lsubdir = lt.get("subdir", "")
-            # Show subdir to highlight e.g. "Bonus Tracks"
             left_lines = [
+                f"File:    {filename}",
                 f"Track#:  {ln}",
                 f"Title:   {ltitle}",
                 f"Artist:  {lartist}"
             ]
         else:
-            left_lines = ["(No local track)", "", "", ""]
+            left_lines = ["(No local track)", "", ""]
 
         # MB side
         if i < len(mb_tracks):
@@ -309,18 +336,18 @@ def generate_side_by_side_diff(local_data, mb_data):
             martist = mt.get("artist", "")
             muri = mt.get("uri", "")
             right_lines = [
+                f"URI:     {muri if muri else '(no MB URI)'}",
                 f"Track#:  {mn}",
                 f"Title:   {mtitle}",
-                f"Artist:  {martist}"
-                f"URI:     {muri if muri else '(no MB URI)'}",
-                ""
+                f"Artist:  {martist}",
             ]
+            print(right_lines)
         else:
-            right_lines = ["(No MB track)", "", "", ""]
+            right_lines = ["(No MB track)", "", ""]
 
-        # Merge them side-by-side
-        chunk = side_by_side_format(left_lines, right_lines, left_width=60) # int(subprocess.getoutput("tput cols")) / 4)
-        track_lines.append(lt.get('filename'))
+        # Merge them side-by-side (with unify_if_identical=True)
+        chunk = side_by_side_format(left_lines, right_lines,
+                                    left_width=60, unify_if_identical=True)
         track_lines.extend(chunk)
         track_lines.append("-" * 120)  # separator
 
@@ -338,11 +365,9 @@ def generate_side_by_side_diff(local_data, mb_data):
 
     return "\n".join(output)
 
-# ==========================
-# 8) main()
-# ==========================
 
 def main():
+    """Main entry point."""
     args = parse_args()
     root_directory = args.root_directory
 
@@ -366,12 +391,16 @@ def main():
     # Query MusicBrainz for matching release
     mb_release = find_best_release_match(guessed_artist, guessed_album)
     if not mb_release:
-        print(f"No matching MusicBrainz release found for guessed artist='{guessed_artist}', album='{guessed_album}'.")
+        print(
+            f"No matching MusicBrainz release found for "
+            f"guessed artist='{guessed_artist}', album='{guessed_album}'."
+        )
         sys.exit(0)
 
-    # Produce side-by-side diff
+    # Produce side-by-side diff, unify identical lines
     diff_output = generate_side_by_side_diff(local_data, mb_release)
     print(diff_output)
+
 
 if __name__ == "__main__":
     main()
