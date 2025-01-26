@@ -4,9 +4,9 @@ A script that:
 1) Recursively scans a local directory to find all audio files (including 'Bonus Tracks' subfolders).
 2) Extracts metadata for each file (title, tracknumber, etc.) via mutagen.
 3) Guesses the artist/album from the top-level directory name.
-4) Looks up matching release data on MusicBrainz (musicbrainzngs), tries to find the best match by track count.
-5) Prints a side-by-side diff (left = local, right = MB) with "== " for identical lines in the center.
-6) Only offers to create new Release Groups (or open the Release edit page, etc.) when something is missing
+4) Looks up matching releases on MusicBrainz (musicbrainzngs) and finds the best release group by comparing total track counts.
+5) Prints a side-by-side diff (left = local, right = MB) with "== " for identical lines in the center, using the chosen release.
+6) Only offers to create new Release Groups (or open the Release edit page, etc.) if something is missing
    or clearly mismatched, with explicit caution prompts to reduce accidental "yes."
 
 Usage:
@@ -24,10 +24,9 @@ from urllib.parse import urlencode, quote_plus
 import musicbrainzngs
 from mutagen import File as MutagenFile
 
-
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 1) MusicBrainz Setup
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 musicbrainzngs.set_useragent(
     "MusicBrainzSideBySideDiff",
     "0.1",
@@ -35,22 +34,19 @@ musicbrainzngs.set_useragent(
 )
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 2) Utility / Argument Parsing
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Recursively gather local tracks, produce a side-by-side diff vs. MusicBrainz, selectively open MB forms."
+        description="Recursively gather local tracks, produce a side-by-side diff vs. MusicBrainz, matching the best release group by track count."
     )
     parser.add_argument("root_directory", help="Root directory of the album (subfolders included).")
     return parser.parse_args()
 
 
 def prompt_yes_no(message):
-    """
-    Simple console prompt that returns True if user answers yes (y/yes).
-    Default is No if user hits enter or types n/no.
-    """
+    """Simple console prompt that returns True if user answers yes, else False."""
     while True:
         ans = input(f"{message} [y/N]? ").strip().lower()
         if ans in ('y', 'yes'):
@@ -61,10 +57,10 @@ def prompt_yes_no(message):
 
 def open_in_browser(url):
     """
-    Cross-platform way to open a URL in the user’s default browser.
-      - macOS:    'open <url>'
-      - Linux:    'xdg-open <url>'
-      - Windows:  'start <url>'
+    Cross-platform way to open a URL in the user’s default browser:
+      - macOS:   'open <url>'
+      - Linux:   'xdg-open <url>'
+      - Windows: 'start <url>'
     """
     system = platform.system().lower()
     if 'darwin' in system:  # macOS
@@ -75,9 +71,9 @@ def open_in_browser(url):
         subprocess.run(['xdg-open', url])
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 3) Local File Gathering
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 VALID_AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".ogg"}
 
 
@@ -138,6 +134,7 @@ def extract_tags_from_file(file_path):
 
 
 def gather_all_local_tracks(root_directory):
+    """Find all valid audio files under root_directory and parse track metadata."""
     root_directory = os.path.abspath(root_directory)
     all_tracks = []
 
@@ -164,14 +161,11 @@ def gather_all_local_tracks(root_directory):
     return all_tracks
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 4) MusicBrainz Lookup + Diff
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def get_mb_release_total_tracks(mb_release):
-    """
-    Given a MusicBrainz release dict from get_release_by_id(...),
-    return the sum of all track counts across all mediums.
-    """
+    """Return total # tracks across all mediums for a single MB release."""
     total = 0
     for medium in mb_release.get('medium-list', []):
         track_list = medium.get('track-list', [])
@@ -179,91 +173,129 @@ def get_mb_release_total_tracks(mb_release):
     return total
 
 
-def find_best_release_match(artist_name, album_name, local_track_count):
+def get_best_release_for_rg(rg_releases, local_track_count):
     """
-    1) Search MB for up to 10 releases that match artist_name and album_name.
-    2) For each release, get detailed data (including track lists).
-    3) Compare total track count to local_track_count.
-    4) Pick the release with the smallest difference in track count.
-       If multiple releases tie, prompt the user which one to pick.
-    5) Return the chosen release dict or None if none found.
+    Given multiple releases for the same release group,
+    pick the single release whose track count is *closest* to local_track_count.
+    Return (release_dict, diff).
     """
-    # Step 1: search for releases
+    best = None
+    best_diff = None
+    for r in rg_releases:
+        count = get_mb_release_total_tracks(r)
+        diff = abs(count - local_track_count)
+        if best is None or diff < best_diff:
+            best = r
+            best_diff = diff
+    return best, best_diff
+
+
+def find_best_release_group(artist_name, album_name, local_track_count):
+    """
+    1) Search MusicBrainz for up to 10 releases matching artist_name + album_name.
+    2) Bucket them by release-group ID.
+    3) For each group, find the release that has the track count closest to local_track_count.
+    4) Pick the group that yields the smallest difference. If there's a tie, ask user to choose.
+    5) Return (best_release, best_release_group) or (None, None).
+
+    'best_release' is the specific release we'll compare side-by-side.
+    'best_release_group' is just the RG dictionary if we want it for reference.
+    """
+    # Step 1: search
     if not artist_name:
         result = musicbrainzngs.search_releases(release=album_name, limit=10)
     else:
         result = musicbrainzngs.search_releases(artist=artist_name, release=album_name, limit=10)
-    releases = result.get('release-list', [])
-    if not releases:
-        return None
+    found = result.get('release-list', [])
+    if not found:
+        return None, None
 
-    # We'll gather (release_id -> difference in track count)
-    candidate_info = []  # list of tuples: (release_dict, track_count_diff)
-    for r in releases:
-        release_id = r['id']
+    # We'll fetch the full data for each release (including tracklists).
+    # Group them by release-group ID => { rgid: [release_dicts], ... }
+    groups = {}  # { rgid -> list of release_dicts }
+    release_info = []
+    for r in found:
+        rid = r['id']
         try:
-            # Step 2: fetch detailed data
             full = musicbrainzngs.get_release_by_id(
-                release_id,
-                includes=["artist-credits", "recordings", "url-rels", "labels", "release-groups"]
+                rid,
+                includes=["artist-credits", "recordings", "release-groups", "labels", "url-rels"]
             )
             release_data = full["release"]
-
-            # Step 3: compare track counts
-            remote_count = get_mb_release_total_tracks(release_data)
-            diff = abs(remote_count - local_track_count)
-            candidate_info.append((release_data, diff))
+            # Extract RG ID
+            rg = release_data.get("release-group")
+            if not rg or "id" not in rg:
+                # Possibly skip if no RG?
+                # We'll treat "no RG" as distinct ID so we can store it anyway
+                rgid = "NO_RG_" + rid  # or something unique
+            else:
+                rgid = rg["id"]
+            groups.setdefault(rgid, []).append(release_data)
         except musicbrainzngs.WebServiceError:
             continue
 
-    if not candidate_info:
-        return None
+    if not groups:
+        return None, None
 
-    # Step 4: pick release with smallest difference
-    candidate_info.sort(key=lambda x: x[1])  # sort by diff ascending
-    best_diff = candidate_info[0][1]
+    # Step 2: For each RG, find best release for local track count
+    rg_candidates = []  # list of (rgid, best_release_in_rg, best_diff_in_rg, release_group_dict)
+    for rgid, releases_in_group in groups.items():
+        # They presumably share the same "release-group" dict, so let's get that from the first
+        rg_dict = releases_in_group[0].get("release-group", {})
+        best_rel, best_diff = get_best_release_for_rg(releases_in_group, local_track_count)
+        rg_candidates.append((rgid, best_rel, best_diff, rg_dict))
 
-    # gather all releases that share that best_diff
-    best_matches = [c for c in candidate_info if c[1] == best_diff]
+    # Step 3: sort by best_diff ascending
+    rg_candidates.sort(key=lambda x: x[2])  # compare on best_diff
 
-    if len(best_matches) == 1:
-        # Exactly one best match
-        return best_matches[0][0]
+    # The top item(s) have the minimal difference
+    min_diff = rg_candidates[0][2]
+    best_list = [c for c in rg_candidates if c[2] == min_diff]
+
+    if len(best_list) == 1:
+        # Exactly one best RG
+        rgid, best_rel, best_diff, rg_dict = best_list[0]
+        return best_rel, rg_dict
     else:
-        # multiple matches have the same track-count difference
-        print(f"\nFound {len(best_matches)} potential releases with the same track-count difference={best_diff}:")
-        for idx, (rel, diffval) in enumerate(best_matches, start=1):
-            rid = rel.get('id')
-            total_remote = get_mb_release_total_tracks(rel)
-            artist_credit = rel.get('artist-credit', [])
-            # Flatten artist name(s)
+        # We have multiple groups with the same difference. Prompt user to choose
+        print(f"\nFound {len(best_list)} release groups with the same track-count difference={min_diff}:")
+        for i, (rgid, best_rel, diff, rg_dict) in enumerate(best_list, start=1):
+            # Summaries
+            # Possibly show the RG title
+            rg_title = rg_dict.get("title") if rg_dict else "(No RG Title)"
+            # Show best_rel title, track count
+            ccount = get_mb_release_total_tracks(best_rel)
+            rel_title = best_rel.get("title", "(No release title)")
+            rid = best_rel.get("id")
+            # flatten artist credits
+            ac_credits = best_rel.get("artist-credit", [])
             ac_names = []
-            for cred in artist_credit:
+            for cred in ac_credits:
                 if isinstance(cred, dict) and 'artist' in cred:
                     ac_names.append(cred['artist']['name'])
                 elif isinstance(cred, str):
                     ac_names.append(cred)
             ac_joined = " & ".join(ac_names) if ac_names else "(Unknown Artist)"
-            title = rel.get('title', '(Unknown Title)')
-            print(f"{idx}) {ac_joined} - {title} [MBID={rid}]  (Tracks={total_remote})")
 
-        # prompt user
+            print(f"{i}) RG: {rgid} '{rg_title}' => Release: {ac_joined} - {rel_title} [MBID={rid}] (Tracks={ccount})")
+
         while True:
-            choice = input(f"Enter a number 1..{len(best_matches)}, or press Enter to cancel: ").strip()
+            choice = input(f"Enter a number 1..{len(best_list)} or press Enter to cancel: ").strip()
             if not choice:
-                return None
+                return None, None
             try:
                 idx = int(choice)
-                if 1 <= idx <= len(best_matches):
-                    return best_matches[idx - 1][0]
+                if 1 <= idx <= len(best_list):
+                    sel = best_list[idx - 1]
+                    return sel[1], sel[3]  # best_rel, rg_dict
             except ValueError:
                 pass
-            print("Invalid choice. Please try again.")
+            print("Invalid choice. Try again.")
 
 
 def side_by_side_format(lines_left, lines_right, left_width=60, unify_if_identical=True):
     """
-    If lines match and are not empty, show "    == line".
+    If lines match and are not empty, show "== line".
     Else side-by-side: left|right.
     """
     output = []
@@ -272,13 +304,16 @@ def side_by_side_format(lines_left, lines_right, left_width=60, unify_if_identic
         l = lines_left[i] if i < len(lines_left) else ""
         r = lines_right[i] if i < len(lines_right) else ""
         if unify_if_identical and l.strip() and (l == r):
-            output.append(f"  == {l}")
+            output.append(f"== {l}")
         else:
             output.append(f"{l:<{left_width}} | {r}")
     return output
 
 
 def generate_side_by_side_diff(local_data, mb_data):
+    """
+    Show a release-level and track-level diff between local_data and mb_data (a single MB release).
+    """
     local_artist = local_data["artist"] or "Unknown Local Artist"
     local_album = local_data["album"] or "Unknown Local Album"
     local_rlines = [
@@ -389,9 +424,9 @@ def generate_side_by_side_diff(local_data, mb_data):
     return "\n".join(out)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 5) Open MB forms (release-group/create, release/add, release/<id>/edit) only if needed
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def create_release_group_on_musicbrainz(artist_mbid, rg_name, primary_type_id=1):
     """
     e.g. https://musicbrainz.org/release-group/create?artist=<artist_mbid>
@@ -429,15 +464,16 @@ def open_release_edit_page(release_mbid):
     open_in_browser(url)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # 6) Main
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def main():
     args = parse_args()
     root_dir = args.root_directory
     base_name = os.path.basename(os.path.normpath(root_dir))
     guessed_artist, guessed_album = guess_artist_and_album_from_directory(base_name)
 
+    # 1) Gather local tracks
     local_tracks = gather_all_local_tracks(root_dir)
     if not local_tracks:
         print(f"No audio tracks found in '{root_dir}'. Aborting.")
@@ -450,42 +486,37 @@ def main():
     }
     local_track_count = len(local_tracks)
 
-    # 1) Attempt to find best MB release by track count
-    mb_release = find_best_release_match(guessed_artist, guessed_album, local_track_count)
-    if not mb_release:
-        # No release found or user canceled tie selection
-        print(f"No MB release found for artist='{guessed_artist}', album='{guessed_album}'.")
-
+    # 2) Find best matching release-group (and best release in that group)
+    best_release, rg_dict = find_best_release_group(guessed_artist, guessed_album, local_track_count)
+    if not best_release:
+        print(f"\nNo MB release group found that matches artist='{guessed_artist}', album='{guessed_album}'.")
         # Possibly we want to create a new release group if truly none found
-        if prompt_yes_no("No MB release. Do you want to create a NEW Release Group?"):
+        if prompt_yes_no("No MB release group. Do you want to create a NEW Release Group?"):
             artist_mbid = input("Enter the Artist MBID (e.g. f4353d58-79ee-...)? ").strip()
             rg_name = guessed_album or "New ReleaseGroup"
             create_release_group_on_musicbrainz(artist_mbid, rg_name, primary_type_id=1)
-
         sys.exit(0)
 
-    # 2) If we found a release, show the diff
-    diff_text = generate_side_by_side_diff(local_data, mb_release)
+    # 3) Show the side-by-side diff for that release
+    diff_text = generate_side_by_side_diff(local_data, best_release)
     print(diff_text)
 
-    # 3) Check if there's a release group
-    rg = mb_release.get("release-group")
-    if not rg or "id" not in rg:
-        # No release-group found. Possibly we ask if user wants to create one.
+    # 4) Check if the release-group is set, or we might create one
+    if rg_dict and "id" in rg_dict:
+        rg_id = rg_dict["id"]
+        rg_title = rg_dict.get("title", "")
+        print(f"\nRelease belongs to Release-Group: {rg_id} ({rg_title})")
+    else:
+        # No RG in that release data; offer to create
         if prompt_yes_no("\nNo Release Group assigned. Do you want to create a new Release Group?"):
             artist_mbid = input("Artist MBID for the new release-group? ").strip()
             rg_name = guessed_album or "New RG"
             create_release_group_on_musicbrainz(artist_mbid, rg_name, primary_type_id=1)
-    else:
-        # We do have a release-group
-        rg_id = rg["id"]
-        rg_title = rg.get("title", "")
-        print(f"\nRelease has Release-Group: {rg_id} ({rg_title})")
 
-    # 4) Check for track mismatches
-    mb_track_count = get_mb_release_total_tracks(mb_release)
+    # 5) If local has more tracks than MB, offer to open the release edit page
+    mb_track_count = get_mb_release_total_tracks(best_release)
     if local_track_count > mb_track_count:
-        rid = mb_release.get("id")
+        rid = best_release.get("id")
         print(f"\nIt seems you have {local_track_count} local tracks, but MB only has {mb_track_count}.")
         msg = ("Do you want to open the MB release edit page to fix/add missing tracks?\n"
                "NOTE: This is recommended ONLY if the official release truly matches your local version.\n"
