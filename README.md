@@ -12,7 +12,7 @@ python musakbrainz.py ~/path/to/some/album
 If there are local files not represented in MB you'll be prompted to open the correct web page to add information. Otherwise, it'll show you that it found the data remotely:
 
 ```
-$ python musakbrainz.py ~/Downloads/A\ Plus\ D/Best\ of\ Bootie\ Mashup\ 2023
+$ python musakbrainz.py '~/Downloads/Adriana A/Best of Bootie Mashup 2023'
 
 Found 3 potential releases with the same track-count difference=0:
 1) Adriana A - Best of Bootie Mashup 2023 [MBID=4d883ba2-b113-408b-942b-532e4478e4ec]  (Tracks=21)
